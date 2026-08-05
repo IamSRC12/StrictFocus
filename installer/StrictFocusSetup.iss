@@ -374,9 +374,10 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   ApkPath   : String;
-  ApkSize   : Int64;
+  ApkSize   : Integer;
   ExitCode  : Integer;
   Model     : String;
+  Fh        : Integer;
 begin
   if CurStep = ssPostInstall then
   begin
@@ -387,7 +388,14 @@ begin
     ApkPath := ExpandConstant('{app}\apk\{#ApkName}');
     ApkSize := 0;
     if FileExists(ApkPath) then
-      ApkSize := GetFileSize(ApkPath);
+    begin
+      Fh := FileOpen(ApkPath, 0);
+      if Fh >= 0 then
+      begin
+        ApkSize := FileSeek(Fh, 0, 2);
+        FileClose(Fh);
+      end;
+    end;
 
     if ApkSize < 10000 then
     begin
