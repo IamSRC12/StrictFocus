@@ -1,244 +1,225 @@
 /**
  * blocker/dnsProxy.js
- * Local DNS Interceptor & Filtering Engine for StrictFocus Desktop.
- *
- * How it works:
- *  1. Runs a lightweight DNS server on 127.0.0.1:53 using Node dgram.
- *  2. Points Windows network adapters to 127.0.0.1 as primary DNS.
- *  3. Flushes Windows DNS cache (ipconfig /flushdns).
- *  4. Intercepts all incoming DNS queries:
- *     - If domain is in whitelist or is a subdomain (e.g., static.pw.live for pw.live):
- *       Forwards query to upstream DNS (1.1.1.1 / 8.8.8.8), returns real IP to client.
- *     - If domain is NOT in whitelist:
- *       Immediately returns NXDOMAIN (RCODE 3). Browser gets instant connection refused.
- *  5. Blocks DNS-over-HTTPS (DoH) IPs in Windows Firewall to prevent browser DoH bypass.
+ * Local DNS server on 127.0.0.1:53. Forwards whitelisted queries upstream,
+ * NXDOMAINs everything else, and reports newly-seen A-record IPs so the
+ * firewall can allow them mid-session.
  */
 
 const dgram = require('dgram');
-const { execSync, exec } = require('child_process');
+const { execSync } = require('child_process');
 
-let server = null;
-let currentWhitelist = [];
-let watchdogTimer = null;
-let isProxyActive = false;
+const UPSTREAMS = ['1.1.1.1', '8.8.8.8'];
 
-// Known public DoH / DoT resolver IPs to block in Firewall so browsers don't bypass local DNS
-const DOH_IPS = [
-  '1.1.1.1', '1.0.0.1', '1.1.1.2', '1.0.0.2', // Cloudflare
-  '8.8.8.8', '8.8.4.4',                       // Google
-  '9.9.9.9', '149.112.112.112',               // Quad9
-  '208.67.222.222', '208.67.220.220',         // OpenDNS
-  '94.140.14.14', '94.140.15.15'              // AdGuard
-];
+let server        = null;
+let whitelist     = [];
+let onNewIps      = null;
+let dnsWatchdog   = null;
+let running       = false;
+let pendingIps    = new Set();
+let flushTimer    = null;
 
-const DOH_RULE_NAME = 'StrictFocus_BLOCK_DOH';
+// ─── Packet helpers ──────────────────────────────────────────────────────────
 
-// ─── DNS Packet Helpers ────────────────────────────────────────────────────────
-
-function parseDomain(buf) {
+function parseQuestion(buf) {
   try {
-    let offset = 12;
+    let off = 12;
     const parts = [];
-    while (offset < buf.length && buf[offset] !== 0) {
-      const len = buf[offset];
-      if ((len & 0xC0) === 0xC0) break; // compression pointer
-      parts.push(buf.toString('utf8', offset + 1, offset + 1 + len));
-      offset += 1 + len;
+    while (off < buf.length && buf[off] !== 0) {
+      const len = buf[off];
+      if ((len & 0xC0) === 0xC0) break;
+      parts.push(buf.toString('utf8', off + 1, off + 1 + len));
+      off += 1 + len;
     }
     return parts.join('.').toLowerCase();
-  } catch {
-    return '';
-  }
+  } catch { return ''; }
 }
 
-function isWhitelisted(domain, list) {
+/** Extracts every A record from a response (covers CNAME chains automatically). */
+function parseAnswerIps(buf) {
+  const ips = [];
+  try {
+    if (buf.length < 12) return ips;
+    const qd = buf.readUInt16BE(4);
+    const an = buf.readUInt16BE(6);
+    let off = 12;
+
+    const skipName = () => {
+      while (off < buf.length) {
+        const len = buf[off];
+        if (len === 0) { off += 1; return; }
+        if ((len & 0xC0) === 0xC0) { off += 2; return; }
+        off += 1 + len;
+      }
+    };
+
+    for (let i = 0; i < qd; i++) { skipName(); off += 4; }
+    for (let i = 0; i < an; i++) {
+      skipName();
+      if (off + 10 > buf.length) break;
+      const type  = buf.readUInt16BE(off);
+      const rdlen = buf.readUInt16BE(off + 8);
+      off += 10;
+      if (type === 1 && rdlen === 4 && off + 4 <= buf.length) {
+        ips.push(`${buf[off]}.${buf[off + 1]}.${buf[off + 2]}.${buf[off + 3]}`);
+      }
+      off += rdlen;
+    }
+  } catch {}
+  return ips;
+}
+
+function makeNxdomain(req) {
+  const res = Buffer.from(req);
+  if (res.length < 12) return res;
+  res[2] = res[2] | 0x80;              // QR = response
+  res[3] = (res[3] & 0xF0) | 0x03;     // RCODE = NXDOMAIN, preserve RA/Z
+  res.writeUInt16BE(0, 6);             // ANCOUNT
+  res.writeUInt16BE(0, 10, 8);         // NSCOUNT & ARCOUNT reset to 0
+  res.writeUInt16BE(0, 10);
+  return res;
+}
+
+function isWhitelisted(domain) {
   if (!domain) return false;
-  const d = domain.toLowerCase();
-  return list.some(w => {
-    const base = w.toLowerCase().trim();
+  const d = domain.toLowerCase().replace(/\.$/, '');
+  return whitelist.some(w => {
+    const base = w.toLowerCase().trim().replace(/\.$/, '');
     return d === base || d.endsWith('.' + base);
   });
 }
 
-function makeNxdomain(reqBuf) {
-  const res = Buffer.from(reqBuf);
-  if (res.length >= 4) {
-    res[2] = 0x81; // Flags byte 1: Response + Recursion Desired
-    res[3] = 0x83; // Flags byte 2: Recursion Available + RCODE 3 (NXDOMAIN)
-  }
-  return res;
+// ─── Batched IP reporting ────────────────────────────────────────────────────
+
+function queueIp(ip) {
+  pendingIps.add(ip);
+  if (flushTimer) return;
+  flushTimer = setTimeout(() => {
+    flushTimer = null;
+    if (pendingIps.size && onNewIps) {
+      const batch = [...pendingIps];
+      pendingIps.clear();
+      try { onNewIps(batch); } catch (e) { console.error('[DNS] onNewIps failed', e.message); }
+    }
+  }, 2000);
 }
 
-// ─── Local DNS Proxy Server ───────────────────────────────────────────────────
+// ─── Server ──────────────────────────────────────────────────────────────────
 
-function startDnsServer(whitelist) {
-  stopDnsServer();
-  currentWhitelist = [...whitelist];
-
-  server = dgram.createSocket('udp4');
+function startServer() {
+  stopServer();
+  server = dgram.createSocket({ type: 'udp4', reuseAddr: true });
 
   server.on('message', (msg, rinfo) => {
-    const domain = parseDomain(msg);
-    const allowed = isWhitelisted(domain, currentWhitelist);
+    const domain = parseQuestion(msg);
 
-    if (!allowed) {
-      // Blocked domain: reply with NXDOMAIN immediately
-      try {
-        server.send(makeNxdomain(msg), rinfo.port, rinfo.address);
-      } catch {}
-    } else {
-      // Whitelisted domain: forward to 1.1.1.1 (Cloudflare) or 8.8.8.8 (Google)
-      const upstream = dgram.createSocket('udp4');
-      const targetDns = (Math.random() > 0.5) ? '1.1.1.1' : '8.8.8.8';
+    if (!isWhitelisted(domain)) {
+      try { server.send(makeNxdomain(msg), rinfo.port, rinfo.address); } catch {}
+      return;
+    }
 
-      upstream.send(msg, 53, targetDns, (err) => {
-        if (err) {
-          try { upstream.close(); } catch {}
-        }
-      });
+    const upstream = dgram.createSocket('udp4');
+    let settled = false;
+    const done = () => { if (!settled) { settled = true; try { upstream.close(); } catch {} } };
 
-      upstream.on('message', (reply) => {
-        try {
-          server.send(reply, rinfo.port, rinfo.address);
-        } catch {}
-        try { upstream.close(); } catch {}
-      });
+    const timer = setTimeout(done, 4000);
 
-      upstream.on('error', () => {
-        try { upstream.close(); } catch {}
-      });
+    upstream.on('message', reply => {
+      clearTimeout(timer);
+      try { server.send(reply, rinfo.port, rinfo.address); } catch {}
+      parseAnswerIps(reply).forEach(queueIp);
+      done();
+    });
+    upstream.on('error', () => { clearTimeout(timer); done(); });
 
-      // Timeout safety
-      setTimeout(() => {
-        try { upstream.close(); } catch {}
-      }, 3000);
+    const target = UPSTREAMS[Math.floor(Math.random() * UPSTREAMS.length)];
+    upstream.send(msg, 53, target, err => { if (err) { clearTimeout(timer); done(); } });
+  });
+
+  server.on('error', err => {
+    console.error('[DNS Proxy] fatal:', err.message);
+    if (err.code === 'EADDRINUSE') {
+      console.error('[DNS Proxy] Port 53 is taken. Stop Internet Connection Sharing / '
+        + 'Hyper-V DNS / Docker DNS, or another resolver, then retry.');
     }
   });
 
-  server.on('error', (err) => {
-    console.error('[DNS Proxy Error]:', err.message);
-  });
-
-  server.bind(53, '127.0.0.1', () => {
-    console.log('[DNS Proxy] Server listening on 127.0.0.1:53');
-  });
+  server.bind(53, '127.0.0.1', () => console.log('[DNS Proxy] listening on 127.0.0.1:53'));
 }
 
-function stopDnsServer() {
-  if (server) {
-    try { server.close(); } catch {}
-    server = null;
-  }
+function stopServer() {
+  if (server) { try { server.close(); } catch {} server = null; }
+  if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+  pendingIps.clear();
 }
 
-// ─── Windows Network Adapter & Firewall Controls ──────────────────────────────
+// ─── System DNS ──────────────────────────────────────────────────────────────
 
 function setSystemDnsToLocal() {
   try {
-    const psCmd = `Get-NetAdapter | Where-Object Status -eq 'Up' | Set-DnsClientServerAddress -ServerAddresses ("127.0.0.1")`;
-    execSync(`powershell -Command "${psCmd}"`, { stdio: 'pipe', windowsHide: true });
+    execSync(
+      `powershell -NoProfile -Command "Get-NetAdapter | Where-Object Status -eq 'Up' | `
+      + `Set-DnsClientServerAddress -ServerAddresses '127.0.0.1'"`,
+      { stdio: 'pipe', windowsHide: true }
+    );
     execSync('ipconfig /flushdns', { stdio: 'pipe', windowsHide: true });
-    console.log('[DNS System] Set system DNS to 127.0.0.1');
-  } catch (e) {
-    console.error('[DNS System] Failed to set local DNS:', e.message);
-  }
+  } catch (e) { console.error('[DNS] set failed:', e.message); }
 }
 
 function resetSystemDns() {
   try {
-    const psCmd = `Get-NetAdapter | Where-Object Status -eq 'Up' | Set-DnsClientServerAddress -ResetServerAddresses`;
-    execSync(`powershell -Command "${psCmd}"`, { stdio: 'pipe', windowsHide: true });
+    execSync(
+      `powershell -NoProfile -Command "Get-NetAdapter | Where-Object Status -eq 'Up' | `
+      + `Set-DnsClientServerAddress -ResetServerAddresses"`,
+      { stdio: 'pipe', windowsHide: true }
+    );
     execSync('ipconfig /flushdns', { stdio: 'pipe', windowsHide: true });
-    console.log('[DNS System] Reset system DNS to default');
-  } catch (e) {
-    console.error('[DNS System] Failed to reset DNS:', e.message);
-  }
+  } catch (e) { console.error('[DNS] reset failed:', e.message); }
 }
 
-function blockDoHInFirewall() {
-  try {
-    const ipList = DOH_IPS.join(',');
-    execSync(`netsh advfirewall firewall delete rule name="${DOH_RULE_NAME}"`, { stdio: 'pipe', windowsHide: true });
-    execSync(
-      `netsh advfirewall firewall add rule name="${DOH_RULE_NAME}" dir=out action=block protocol=TCP remoteip=${ipList} remoteport=443,853 enable=yes`,
-      { stdio: 'pipe', windowsHide: true }
-    );
-    execSync(
-      `netsh advfirewall firewall add rule name="${DOH_RULE_NAME}_UDP" dir=out action=block protocol=UDP remoteip=${ipList} remoteport=443,853 enable=yes`,
-      { stdio: 'pipe', windowsHide: true }
-    );
-    console.log('[Firewall] Blocked DoH providers');
-  } catch (e) {
-    console.error('[Firewall] Failed to block DoH:', e.message);
-  }
-}
-
-function unblockDoHInFirewall() {
-  try {
-    execSync(`netsh advfirewall firewall delete rule name="${DOH_RULE_NAME}"`, { stdio: 'pipe', windowsHide: true });
-    execSync(`netsh advfirewall firewall delete rule name="${DOH_RULE_NAME}_UDP"`, { stdio: 'pipe', windowsHide: true });
-    console.log('[Firewall] Unblocked DoH providers');
-  } catch {}
-}
-
-// ─── Watchdog ──────────────────────────────────────────────────────────────────
-
-function startWatchdog(whitelist) {
+/** Re-asserts 127.0.0.1 only if something changed it — avoids constant churn. */
+function startWatchdog() {
   stopWatchdog();
-  watchdogTimer = setInterval(() => {
-    if (!isProxyActive) return;
-    setSystemDnsToLocal();
-  }, 15000);
+  dnsWatchdog = setInterval(() => {
+    if (!running) return;
+    try {
+      const out = execSync(
+        `powershell -NoProfile -Command "(Get-DnsClientServerAddress -AddressFamily IPv4 | `
+        + `Where-Object { $_.ServerAddresses -notcontains '127.0.0.1' -and $_.ServerAddresses.Count -gt 0 } | `
+        + `Measure-Object).Count"`,
+        { stdio: 'pipe', windowsHide: true }
+      ).toString().trim();
+      if (parseInt(out, 10) > 0) {
+        console.warn('[DNS Watchdog] DNS was changed — re-asserting 127.0.0.1');
+        setSystemDnsToLocal();
+      }
+    } catch {}
+  }, 15_000);
 }
 
 function stopWatchdog() {
-  if (watchdogTimer) {
-    clearInterval(watchdogTimer);
-    watchdogTimer = null;
-  }
+  if (dnsWatchdog) { clearInterval(dnsWatchdog); dnsWatchdog = null; }
 }
 
-// ─── Public API ────────────────────────────────────────────────────────────────
+// ─── Public API ──────────────────────────────────────────────────────────────
 
-function applyRules(whitelist) {
-  isProxyActive = true;
-  startDnsServer(whitelist);
-  blockDoHInFirewall();
+function start(domains, newIpCallback) {
+  whitelist = [...domains];
+  onNewIps  = newIpCallback;
+  running   = true;
+  startServer();
   setSystemDnsToLocal();
-  startWatchdog(whitelist);
+  startWatchdog();
 }
 
-function removeAllRules() {
-  isProxyActive = false;
+function stop() {
+  running = false;
   stopWatchdog();
-  stopDnsServer();
+  stopServer();
   resetSystemDns();
-  unblockDoHInFirewall();
+  onNewIps = null;
 }
 
-function updateWhitelist(whitelist) {
-  currentWhitelist = [...whitelist];
-}
+function updateWhitelist(domains) { whitelist = [...domains]; }
+function isRunning() { return running; }
 
-function isRunningAsAdmin() {
-  try {
-    execSync('net session', { stdio: 'pipe', windowsHide: true });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function verifyRulesActive() {
-  return isProxyActive;
-}
-
-module.exports = {
-  applyRules,
-  removeAllRules,
-  updateWhitelist,
-  isRunningAsAdmin,
-  verifyRulesActive,
-  startWatchdog: () => {},
-  stopWatchdog: () => {}
-};
+module.exports = { start, stop, updateWhitelist, isRunning, UPSTREAMS };
