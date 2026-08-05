@@ -11,9 +11,8 @@
 
 const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage, shell } = require('electron');
 const path        = require('path');
-const sessionMgr  = require('./blocker/sessionManager');
-const firewall    = require('./blocker/firewallManager');
-const dnsResolver = require('./blocker/dnsResolver');
+const sessionMgr = require('./blocker/sessionManager');
+const dnsProxy   = require('./blocker/dnsProxy');
 
 // ─── State ────────────────────────────────────────────────────────────────────
 
