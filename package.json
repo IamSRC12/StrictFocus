@@ -17,9 +17,14 @@
     "electron": "^31.0.0",
     "electron-builder": "^24.13.3"
   },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/strictfocus/desktop.git"
+  },
   "build": {
     "appId": "com.strictfocus.desktop",
     "productName": "StrictFocus",
+    "publish": null,
     "win": {
       "target": [
         {
