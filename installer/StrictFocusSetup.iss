@@ -383,13 +383,30 @@ begin
     // ADB is now in final location
     AdbBin := ExpandConstant('{app}\adb\adb.exe');
 
-    // Check if APK is real by loading first bytes — placeholder is empty (0 bytes)
+    // Check if APK is real by reading its header bytes via a shell dir command
     ApkPath    := ExpandConstant('{app}\apk\{#ApkName}');
     ApkContent := '';
-    if FileExists(ApkPath) then
-      LoadStringFromFile(ApkPath, ApkContent);
+    if not FileExists(ApkPath) then
+    begin
+      MsgBox('APK file not found at: ' + ApkPath, mbError, MB_OK);
+      Exit;
+    end;
 
-    if Length(ApkContent) < 10 then
+    // Use a PowerShell one-liner to get file size and store in temp file
+    begin
+      var SizeTmp : String;
+      var SizeOut : AnsiString;
+      SizeTmp := ExpandConstant('{tmp}\apksize.txt');
+      Exec(ExpandConstant('{cmd}'),
+           '/C "for %I in ("' + ApkPath + '") do echo %~zI > "' + SizeTmp + '"2>&1"',
+           '', SW_HIDE, ewWaitUntilTerminated, ExitCode);
+      SizeOut := '';
+      if FileExists(SizeTmp) then
+        LoadStringFromFile(SizeTmp, SizeOut);
+      ApkContent := String(SizeOut);
+    end;
+
+    if (Trim(ApkContent) = '0') or (Length(Trim(ApkContent)) = 0) then
     begin
       MsgBox(
         'INFO: This installer was built without the final APK.' + #13#10 + #13#10 +
