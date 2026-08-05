@@ -373,31 +373,23 @@ end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 var
-  ApkPath   : String;
-  ApkSize   : Integer;
-  ExitCode  : Integer;
-  Model     : String;
-  Fh        : Integer;
+  ApkPath    : String;
+  ApkContent : AnsiString;
+  ExitCode   : Integer;
+  Model      : String;
 begin
   if CurStep = ssPostInstall then
   begin
     // ADB is now in final location
     AdbBin := ExpandConstant('{app}\adb\adb.exe');
 
-    // Check if APK is real (> 10 KB) or a placeholder
-    ApkPath := ExpandConstant('{app}\apk\{#ApkName}');
-    ApkSize := 0;
+    // Check if APK is real by loading first bytes — placeholder is empty (0 bytes)
+    ApkPath    := ExpandConstant('{app}\apk\{#ApkName}');
+    ApkContent := '';
     if FileExists(ApkPath) then
-    begin
-      Fh := FileOpen(ApkPath, 0);
-      if Fh >= 0 then
-      begin
-        ApkSize := FileSeek(Fh, 0, 2);
-        FileClose(Fh);
-      end;
-    end;
+      LoadStringFromFile(ApkPath, ApkContent);
 
-    if ApkSize < 10000 then
+    if Length(ApkContent) < 10 then
     begin
       MsgBox(
         'INFO: This installer was built without the final APK.' + #13#10 + #13#10 +
