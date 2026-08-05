@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">StrictFocus</string>
+    <string name="accessibility_service_label">StrictFocus Anti-Bypass Guard</string>
+    <string name="accessibility_service_description">StrictFocus uses this service to prevent you from bypassing an active focus session by navigating to VPN settings or App Info. This is required for strict productivity enforcement.</string>
+    <string name="vpn_notification_channel_id">strictfocus_vpn_channel</string>
+    <string name="vpn_notification_channel_name">Focus Session</string>
+    <string name="vpn_notification_title">Focus Session Active</string>
+    <string name="vpn_notification_text">Blocking distracting sites. Stay focused!</string>
+</resources>
