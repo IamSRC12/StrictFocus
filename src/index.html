@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'">
+  <title>StrictFocus</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+  <!-- ── Custom Titlebar ────────────────────────────────────────────── -->
+  <div class="titlebar" id="titlebar">
+    <div class="titlebar-logo">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none">
+        <path d="M12 2L4 6v6c0 5.25 3.5 10.15 8 11.5C16.5 22.15 20 17.25 20 12V6L12 2z" fill="url(#shieldGrad)"/>
+        <path d="M9 12l2 2 4-4" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        <defs>
+          <linearGradient id="shieldGrad" x1="4" y1="2" x2="20" y2="24">
+            <stop stop-color="#7C3AED"/>
+            <stop offset="1" stop-color="#06B6D4"/>
+          </linearGradient>
+        </defs>
+      </svg>
+      <span>StrictFocus</span>
+    </div>
+    <div class="titlebar-controls">
+      <button id="btn-minimize" class="titlebar-btn" title="Minimize">&#x2212;</button>
+      <button id="btn-close"    class="titlebar-btn close" title="Close">&#x2715;</button>
+    </div>
+  </div>
+
+  <!-- ── Background orbs ────────────────────────────────────────────── -->
+  <div class="bg-orb orb1"></div>
+  <div class="bg-orb orb2"></div>
+  <div class="bg-orb orb3"></div>
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!--                      SETUP SCREEN                                 -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <div id="screen-setup" class="screen active">
+    <div class="scroll-container">
+
+      <!-- Hero -->
+      <div class="hero">
+        <div class="hero-icon-wrap">
+          <div class="hero-icon-glow"></div>
+          <div class="hero-icon">
+            <svg width="40" height="40" viewBox="0 0 24 24" fill="none">
+              <path d="M12 2L4 6v6c0 5.25 3.5 10.15 8 11.5C16.5 22.15 20 17.25 20 12V6L12 2z" fill="url(#shG2)"/>
+              <path d="M9 12l2 2 4-4" stroke="white" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+              <defs>
+                <linearGradient id="shG2" x1="4" y1="2" x2="20" y2="24">
+                  <stop stop-color="#7C3AED"/><stop offset="1" stop-color="#06B6D4"/>
+                </linearGradient>
+              </defs>
+            </svg>
+          </div>
+        </div>
+        <h1 class="hero-title">StrictFocus</h1>
+        <p class="hero-sub">Zero-distraction productivity enforcer for Windows</p>
+      </div>
+
+      <!-- Admin Warning -->
+      <div id="admin-warning" class="card warning-card hidden">
+        <div class="warning-icon">⚠️</div>
+        <div>
+          <div class="card-label" style="color:#FBBF24">Run as Administrator Required</div>
+          <div class="card-desc">StrictFocus needs Admin rights to control Windows Firewall. Please restart the app as Administrator.</div>
+        </div>
+      </div>
+
+      <!-- Timer Card -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-label">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#06B6D4" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+            Session Duration
+          </div>
+          <div class="duration-badge" id="duration-display">25m</div>
+        </div>
+        <input type="range" id="timer-slider" class="slider" min="1" max="480" value="25" step="1" />
+        <div class="chip-row">
+          <button class="chip" data-mins="15">15m</button>
+          <button class="chip" data-mins="25">25m</button>
+          <button class="chip active" data-mins="45">45m</button>
+          <button class="chip" data-mins="60">1h</button>
+          <button class="chip" data-mins="90">1.5h</button>
+          <button class="chip" data-mins="120">2h</button>
+          <button class="chip" data-mins="240">4h</button>
+          <button class="chip" data-mins="480">8h</button>
+        </div>
+      </div>
+
+      <!-- Whitelist Card -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-label">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#10B981" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
+            Allowed Domains
+          </div>
+          <div class="count-badge" id="domain-count">3 domains</div>
+        </div>
+        <p class="card-desc">Add base domains — all subdomains are included automatically (e.g. add <code>notion.so</code> to allow <code>api.notion.so</code>)</p>
+
+        <div class="input-row">
+          <input type="text" id="domain-input" class="text-input" placeholder="e.g. notion.so, pw.live, figma.com" autocomplete="off" spellcheck="false" />
+          <button id="btn-add-domain" class="btn-icon" title="Add domain">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          </button>
+        </div>
+
+        <div id="domain-list" class="domain-list">
+          <!-- populated by renderer.js -->
+        </div>
+      </div>
+
+      <!-- Start Button -->
+      <button id="btn-start" class="btn-start">
+        <span class="btn-start-icon">▶</span>
+        Start Focus Session
+      </button>
+      <p class="start-note">⚠️ Once started, the session cannot be stopped until the timer expires</p>
+
+    </div><!-- /scroll-container -->
+  </div><!-- /screen-setup -->
+
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!--                    RESOLVING SCREEN                               -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <div id="screen-resolving" class="screen">
+    <div class="center-content">
+      <div class="spinner"></div>
+      <h2 class="resolving-title">Resolving Domains</h2>
+      <p class="resolving-sub">Building your internet whitelist...</p>
+      <div id="resolving-log" class="resolving-log"></div>
+    </div>
+  </div>
+
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!--                    ACTIVE SESSION SCREEN                          -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <div id="screen-active" class="screen">
+    <div class="center-content">
+
+      <div class="session-status-badge">🔒 FOCUS SESSION ACTIVE</div>
+
+      <!-- Timer ring -->
+      <div class="timer-ring-container">
+        <div class="timer-ring-glow"></div>
+        <svg class="timer-svg" width="260" height="260" viewBox="0 0 260 260">
+          <circle class="ring-bg"       cx="130" cy="130" r="115" />
+          <circle class="ring-progress" cx="130" cy="130" r="115" id="ring-progress" />
+        </svg>
+        <div class="timer-content">
+          <div class="timer-display" id="timer-display">00:00</div>
+          <div class="timer-label">remaining</div>
+        </div>
+      </div>
+
+      <!-- Stats row -->
+      <div class="stats-row">
+        <div class="stat-card">
+          <div class="stat-value" id="stat-domains">0</div>
+          <div class="stat-label">domains allowed</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="stat-ips">0</div>
+          <div class="stat-label">IPs whitelisted</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-value" id="stat-rules">✓</div>
+          <div class="stat-label">firewall active</div>
+        </div>
+      </div>
+
+      <!-- Allowed domains list -->
+      <div class="active-domains" id="active-domains"></div>
+
+      <!-- Motivation text -->
+      <p class="motivation" id="motivation-text">Stay in the zone. You've got this! 💪</p>
+
+    </div>
+  </div>
+
+
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <!--                    SESSION DONE SCREEN                            -->
+  <!-- ══════════════════════════════════════════════════════════════════ -->
+  <div id="screen-done" class="screen">
+    <div class="center-content">
+      <div class="done-icon">🎉</div>
+      <h2 class="done-title">Session Complete!</h2>
+      <p class="done-sub">Great work. Your internet access has been restored.</p>
+      <button id="btn-new-session" class="btn-start" style="margin-top:32px">Start New Session</button>
+    </div>
+  </div>
+
+  <script src="renderer.js"></script>
+</body>
+</html>
