@@ -1,0 +1,51 @@
+{
+  "name": "strictfocus",
+  "version": "1.0.0",
+  "description": "Whitelist-only desktop productivity enforcer with Windows Firewall blocking",
+  "main": "main.js",
+  "author": "StrictFocus",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win --x64",
+    "dist-portable": "electron-builder --win portable --x64"
+  },
+  "dependencies": {
+    "electron-store": "^8.1.0"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.strictfocus.desktop",
+    "productName": "StrictFocus",
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] }
+      ],
+      "icon": "assets/icon.ico",
+      "requestedExecutionLevel": "requireAdministrator"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "installerIcon": "assets/icon.ico",
+      "installerHeaderIcon": "assets/icon.ico",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "StrictFocus"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "src/**",
+      "blocker/**",
+      "assets/**",
+      "node_modules/**"
+    ],
+    "directories": {
+      "output": "dist"
+    }
+  }
+}
