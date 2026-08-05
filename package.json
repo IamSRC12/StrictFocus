@@ -22,7 +22,12 @@
     "productName": "StrictFocus",
     "win": {
       "target": [
-        { "target": "nsis", "arch": ["x64"] }
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
       ],
       "icon": "assets/icon.ico",
       "requestedExecutionLevel": "requireAdministrator"
@@ -47,5 +52,8 @@
     "directories": {
       "output": "dist"
     }
+  },
+  "allowScripts": {
+    "electron@31.7.7": true
   }
 }
