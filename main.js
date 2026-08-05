@@ -106,19 +106,13 @@ function updateTrayMenu() {
   ]));
 }
 
-// ─── Firewall restoration after restart ───────────────────────────────────────
+// ─── Firewall & DNS restoration after restart ─────────────────────────
 
 async function restoreFirewallRules(whitelist) {
   try {
-    mainWindow.webContents.send('resolving-start');
-    allowedIps = await dnsResolver.resolveWhitelist(whitelist, (domain, count) => {
-      mainWindow.webContents.send('resolve-progress', { domain, count });
-    });
-    firewall.applyRules(allowedIps);
-    firewall.startWatchdog(allowedIps);
-    mainWindow.webContents.send('resolving-done', { ipCount: allowedIps.size });
+    dnsProxy.applyRules(whitelist);
   } catch (e) {
-    console.error('Failed to restore firewall rules:', e);
+    console.error('Failed to restore DNS rules:', e);
   }
 }
 
@@ -147,34 +141,19 @@ async function startSession(durationMs, whitelist) {
   // 1. Save session state
   sessionMgr.startSession(durationMs, whitelist);
 
-  // 2. Resolve IPs for whitelist
-  mainWindow.webContents.send('resolving-start');
-  try {
-    allowedIps = await dnsResolver.resolveWhitelist(whitelist, (domain, count) => {
-      mainWindow.webContents.send('resolve-progress', { domain, count });
-    });
-  } catch (e) {
-    console.error('DNS resolution failed:', e);
-    allowedIps = new Set();
-  }
-  mainWindow.webContents.send('resolving-done', { ipCount: allowedIps.size });
+  // 2. Activate DNS Proxy & DoH firewall blocking
+  dnsProxy.applyRules(whitelist);
 
-  // 3. Apply firewall rules
-  firewall.applyRules(allowedIps);
-  firewall.startWatchdog(allowedIps);
-
-  // 4. Start countdown
+  // 3. Start countdown
   startTickLoop();
 
-  return { ipCount: allowedIps.size };
+  return { ipCount: whitelist.length };
 }
 
 function endSession() {
   stopTickLoop();
-  firewall.removeAllRules();
-  firewall.stopWatchdog();
+  dnsProxy.removeAllRules();
   sessionMgr.endSession();
-  allowedIps.clear();
   mainWindow && mainWindow.webContents.send('session-ended');
   updateTrayMenu();
 }
@@ -182,7 +161,7 @@ function endSession() {
 function cleanup() {
   stopTickLoop();
   if (!sessionMgr.isActive()) {
-    firewall.removeAllRules();
+    dnsProxy.removeAllRules();
   }
 }
 
@@ -193,8 +172,8 @@ ipcMain.handle('get-status', () => {
     isActive:      sessionMgr.isActive(),
     remainingMs:   sessionMgr.getRemainingMs(),
     session:       sessionMgr.getSession(),
-    isAdmin:       firewall.isRunningAsAdmin(),
-    rulesActive:   firewall.verifyRulesActive()
+    isAdmin:       dnsProxy.isRunningAsAdmin(),
+    rulesActive:   dnsProxy.verifyRulesActive()
   };
 });
 
