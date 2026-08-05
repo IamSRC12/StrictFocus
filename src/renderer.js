@@ -257,6 +257,12 @@ window.sf.onResolvingStart(() => {
 
 window.sf.onResolvingDone(({ ipCount }) => {
   allowedIpCount = ipCount;
+  $('stat-ips').textContent = allowedIpCount;
+});
+
+window.sf.onIpCount(({ ipCount }) => {
+  allowedIpCount = ipCount;
+  $('stat-ips').textContent = allowedIpCount;
 });
 
 window.sf.onSessionRestored(({ remainingMs, whitelist }) => {

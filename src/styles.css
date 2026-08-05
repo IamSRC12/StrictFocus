@@ -34,7 +34,7 @@ html, body {
   overflow: hidden;
   background: var(--bg);
   color: var(--text-1);
-  font-family: 'Inter', system-ui, sans-serif;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
   user-select: none;
 }

@@ -20,6 +20,7 @@ contextBridge.exposeInMainWorld('sf', {
   onResolvingStart:   (cb) => ipcRenderer.on('resolving-start',   ()      => cb()),
   onResolveProgress:  (cb) => ipcRenderer.on('resolve-progress',  (_e, d) => cb(d)),
   onResolvingDone:    (cb) => ipcRenderer.on('resolving-done',    (_e, d) => cb(d)),
+  onIpCount:          (cb) => ipcRenderer.on('ip-count',          (_e, d) => cb(d)),
   onCloseBlocked:     (cb) => ipcRenderer.on('close-blocked',     ()      => cb()),
 
   // ── Cleanup ───────────────────────────────────────────────────────────────

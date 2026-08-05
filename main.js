@@ -2,26 +2,42 @@
  * main.js — StrictFocus Desktop (Electron main process)
  *
  * Responsibilities:
- *  - Create and manage the BrowserWindow
- *  - Handle IPC from renderer (start/stop session, check status)
- *  - Orchestrate firewallManager + dnsResolver + sessionManager
+ *  - Create and manage the BrowserWindow & System Tray
+ *  - Orchestrate firewallManager + dnsProxy + dnsResolver + sessionManager
+ *  - Order of operations on session start:
+ *      1. Resolve whitelist domains to IPs while internet still works.
+ *      2. Persist session state.
+ *      3. Add ALLOW rules for loopback, LAN, DHCP, app DNS, & whitelisted IPs.
+ *      4. ONLY THEN flip DefaultOutboundAction to Block on all profiles.
+ *      5. Start local DNS proxy (127.0.0.1:53) to return instant NXDOMAIN &
+ *         dynamically discover new IPs to allow mid-session.
+ *  - Handle app crash recovery (recoverIfStranded) on startup
  *  - Prevent app close during active session
- *  - Watchdog timer to keep rules enforced
  */
 
 const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage, shell } = require('electron');
 const path        = require('path');
-const sessionMgr = require('./blocker/sessionManager');
-const dnsProxy   = require('./blocker/dnsProxy');
-
-// ─── State ────────────────────────────────────────────────────────────────────
+const sessionMgr  = require('./blocker/sessionManager');
+const dnsProxy    = require('./blocker/dnsProxy');
+const firewall    = require('./blocker/firewallManager');
+const dnsResolver = require('./blocker/dnsResolver');
 
 let mainWindow   = null;
 let tray         = null;
-let tickInterval = null;    // 1s countdown tick
+let tickInterval = null;
 let allowedIps   = new Set();
 
-// ─── Window ───────────────────────────────────────────────────────────────────
+// ─── Single instance & App lifecycle ──────────────────────────────────────────
+
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.whenReady().then(() => {
+    firewall.writeRestoreScript();
+    firewall.recoverIfStranded(sessionMgr.isActive());
+    createWindow();
+  });
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -30,7 +46,7 @@ function createWindow() {
     minWidth:        760,
     minHeight:       580,
     resizable:       true,
-    frame:           false,         // custom titlebar
+    frame:           false,
     transparent:     true,
     backgroundColor: '#00000000',
     webPreferences: {
@@ -46,7 +62,6 @@ function createWindow() {
 
   mainWindow.once('ready-to-show', () => {
     mainWindow.show();
-    // If session was active when we launched (e.g., after a restart), restore UI
     if (sessionMgr.isActive()) {
       const sess = sessionMgr.getSession();
       if (sess) {
@@ -55,13 +70,11 @@ function createWindow() {
           whitelist:   sess.whitelist
         });
         startTickLoop();
-        // Re-apply firewall rules with the persisted whitelist
-        restoreFirewallRules(sess.whitelist);
+        restoreAfterRestart(sess.whitelist);
       }
     }
   });
 
-  // Prevent close during active session
   mainWindow.on('close', (e) => {
     if (sessionMgr.isActive()) {
       e.preventDefault();
@@ -106,16 +119,6 @@ function updateTrayMenu() {
   ]));
 }
 
-// ─── Firewall & DNS restoration after restart ─────────────────────────
-
-async function restoreFirewallRules(whitelist) {
-  try {
-    dnsProxy.applyRules(whitelist);
-  } catch (e) {
-    console.error('Failed to restore DNS rules:', e);
-  }
-}
-
 // ─── Tick loop ────────────────────────────────────────────────────────────────
 
 function startTickLoop() {
@@ -138,44 +141,77 @@ function stopTickLoop() {
 // ─── Session lifecycle ────────────────────────────────────────────────────────
 
 async function startSession(durationMs, whitelist) {
-  // 1. Save session state
+  if (!firewall.isRunningAsAdmin()) return { error: 'Administrator privileges required.' };
+
+  // 1. Resolve BEFORE locking down — resolution needs working internet.
+  mainWindow && mainWindow.webContents.send('resolving-start');
+  allowedIps = await dnsResolver.resolveWhitelist(whitelist, (domain, count) => {
+    mainWindow && mainWindow.webContents.send('resolve-progress', { domain, count });
+  });
+
+  if (allowedIps.size === 0) {
+    return { error: 'Could not resolve any whitelisted domain. Check your connection.' };
+  }
+
+  // 2. Persist session state.
   sessionMgr.startSession(durationMs, whitelist);
 
-  // 2. Activate DNS Proxy & DoH firewall blocking
-  dnsProxy.applyRules(whitelist);
+  // 3. Lock down the firewall (allow rules first, then deny-by-default).
+  firewall.applyRules(allowedIps, {
+    appPath:         process.execPath,
+    upstreamDnsIps:  dnsProxy.UPSTREAMS,
+    durationMinutes: durationMs / 60000
+  });
 
-  // 3. Start countdown
+  // 4. Start local DNS; new IPs discovered mid-session get allowed on the fly.
+  dnsProxy.start(whitelist, (newIps) => {
+    const added = firewall.addAllowedIps(newIps);
+    if (added) {
+      newIps.forEach(ip => allowedIps.add(ip));
+      mainWindow && mainWindow.webContents.send('ip-count', { ipCount: allowedIps.size });
+    }
+  });
+
   startTickLoop();
-
-  return { ipCount: whitelist.length };
+  mainWindow && mainWindow.webContents.send('resolving-done', { ipCount: allowedIps.size });
+  return { ipCount: allowedIps.size };
 }
 
 function endSession() {
   stopTickLoop();
-  dnsProxy.removeAllRules();
+  dnsProxy.stop();
+  firewall.removeAllRules();
   sessionMgr.endSession();
   mainWindow && mainWindow.webContents.send('session-ended');
   updateTrayMenu();
 }
 
+async function restoreAfterRestart(whitelist) {
+  allowedIps = await dnsResolver.resolveWhitelist(whitelist).catch(() => new Set());
+  firewall.addAllowedIps(allowedIps);
+  firewall.startWatchdog();
+  dnsProxy.start(whitelist, (ips) => firewall.addAllowedIps(ips));
+}
+
 function cleanup() {
   stopTickLoop();
   if (!sessionMgr.isActive()) {
-    dnsProxy.removeAllRules();
+    dnsProxy.stop();
+    firewall.removeAllRules();
   }
 }
 
 // ─── IPC Handlers ─────────────────────────────────────────────────────────────
 
-ipcMain.handle('get-status', () => {
-  return {
-    isActive:      sessionMgr.isActive(),
-    remainingMs:   sessionMgr.getRemainingMs(),
-    session:       sessionMgr.getSession(),
-    isAdmin:       dnsProxy.isRunningAsAdmin(),
-    rulesActive:   dnsProxy.verifyRulesActive()
-  };
-});
+ipcMain.handle('get-status', () => ({
+  isActive:    sessionMgr.isActive(),
+  remainingMs: sessionMgr.getRemainingMs(),
+  session:     sessionMgr.getSession(),
+  isAdmin:     firewall.isRunningAsAdmin(),
+  rulesActive: sessionMgr.isActive() ? firewall.verifyRulesActive() : false,
+  ipCount:     allowedIps.size,
+  restorePath: firewall.restoreScriptPath
+}));
 
 ipcMain.handle('start-session', async (_event, { durationMs, whitelist }) => {
   if (sessionMgr.isActive()) {
@@ -185,10 +221,8 @@ ipcMain.handle('start-session', async (_event, { durationMs, whitelist }) => {
   return { success: true, ...result };
 });
 
-// Minimize window
 ipcMain.on('minimize-window', () => mainWindow && mainWindow.minimize());
 
-// Close window (only if no session)
 ipcMain.on('close-window', () => {
   if (!sessionMgr.isActive()) {
     cleanup();
@@ -198,19 +232,7 @@ ipcMain.on('close-window', () => {
   }
 });
 
-// Open external link
 ipcMain.on('open-external', (_e, url) => shell.openExternal(url));
-
-// ─── App lifecycle ─────────────────────────────────────────────────────────────
-
-app.whenReady().then(() => {
-  // Single instance lock
-  if (!app.requestSingleInstanceLock()) {
-    app.quit();
-    return;
-  }
-  createWindow();
-});
 
 app.on('second-instance', () => {
   if (mainWindow) {
@@ -224,14 +246,11 @@ app.on('window-all-closed', () => {
     cleanup();
     app.quit();
   }
-  // If session is active: keep running (tray only mode)
 });
 
 app.on('before-quit', () => {
   if (!sessionMgr.isActive()) cleanup();
 });
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
 
 function formatMs(ms) {
   if (ms <= 0) return '00:00';
