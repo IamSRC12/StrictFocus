@@ -530,3 +530,32 @@ body::before {
 
 /* ── SVG gradient def (hidden) ─────────────────────────────── */
 svg.defs-only { position:absolute; width:0; height:0; overflow:hidden; }
+
+/* ── Live Blocked Log ───────────────────────────────────────── */
+.blocked-log {
+  width: 100%;
+  max-width: 480px;
+  margin-top: 20px;
+  background: rgba(239, 68, 68, 0.05);
+  border: 1px solid rgba(239, 68, 68, 0.2);
+  border-radius: 12px;
+  padding: 12px;
+  text-align: left;
+  max-height: 140px;
+  overflow-y: auto;
+}
+.blocked-log-title {
+  font-size: 11px;
+  color: var(--red);
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  margin-bottom: 8px;
+}
+.blocked-item {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: var(--text-2);
+  padding: 3px 0;
+  border-bottom: 1px solid rgba(255,255,255,0.05);
+}

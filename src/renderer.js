@@ -334,3 +334,20 @@ function pulse(el) {
   el.style.animation = 'bounceIn 0.3s ease';
   setTimeout(() => el.style.animation = '', 300);
 }
+
+// ─── Live Blocked Log ─────────────────────────────────────────────────────────
+
+const blockedLogList = document.getElementById('blocked-log-list');
+
+window.sf.onDnsBlocked(({ domain }) => {
+  if (!blockedLogList) return;
+  const item = document.createElement('div');
+  item.className = 'blocked-item';
+  item.textContent = `🚫 ${domain}`;
+  blockedLogList.prepend(item);
+
+  // Keep only the last 8 items
+  while (blockedLogList.children.length > 8) {
+    blockedLogList.removeChild(blockedLogList.lastChild);
+  }
+});
