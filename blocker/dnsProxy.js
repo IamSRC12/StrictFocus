@@ -83,7 +83,11 @@ function isWhitelisted(domain) {
   if (!domain) return false;
   const d = domain.toLowerCase().replace(/\.$/, '');
   return whitelist.some(w => {
-    const base = w.toLowerCase().trim().replace(/\.$/, '');
+    const base = w.toLowerCase().trim()
+      .replace(/^https?:\/\//, '')
+      .replace(/^www\./, '')
+      .split('/')[0]
+      .replace(/\.$/, '');
     return d === base || d.endsWith('.' + base);
   });
 }
