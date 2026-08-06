@@ -73,15 +73,26 @@ function makeNxdomain(req) {
   if (res.length < 12) return res;
   res[2] = res[2] | 0x80;              // QR = response
   res[3] = (res[3] & 0xF0) | 0x03;     // RCODE = NXDOMAIN, preserve RA/Z
-  res.writeUInt16BE(0, 6);             // ANCOUNT
-  res.writeUInt16BE(0, 10, 8);         // NSCOUNT & ARCOUNT reset to 0
-  res.writeUInt16BE(0, 10);
+  res.writeUInt16BE(0, 6);             // ANCOUNT = 0
+  res.writeUInt16BE(0, 8);             // NSCOUNT = 0  (FIXED)
+  res.writeUInt16BE(0, 10);            // ARCOUNT = 0  (FIXED)
   return res;
 }
+
+const DOH_DOMAINS = [
+  'dns.google', 'cloudflare-dns.com', 'chrome.cloudflare-dns.com',
+  'mozilla.cloudflare-dns.com', 'dns.quad9.net', 'doh.opendns.com'
+];
 
 function isWhitelisted(domain) {
   if (!domain) return false;
   const d = domain.toLowerCase().replace(/\.$/, '');
+  
+  // Always block DoH domains to force browsers to use system DNS
+  if (DOH_DOMAINS.some(doh => d === doh || d.endsWith('.' + doh))) {
+    return false; 
+  }
+
   return whitelist.some(w => {
     const base = w.toLowerCase().trim()
       .replace(/^https?:\/\//, '')
@@ -109,6 +120,8 @@ function queueIp(ip) {
 
 // ─── Server ──────────────────────────────────────────────────────────────────
 
+let onBlockedDomain = null;
+
 function startServer() {
   stopServer();
   server = dgram.createSocket({ type: 'udp4', reuseAddr: true });
@@ -117,6 +130,7 @@ function startServer() {
     const domain = parseQuestion(msg);
 
     if (!isWhitelisted(domain)) {
+      if (onBlockedDomain && domain) onBlockedDomain(domain);
       try { server.send(makeNxdomain(msg), rinfo.port, rinfo.address); } catch {}
       return;
     }
@@ -206,9 +220,10 @@ function stopWatchdog() {
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
-function start(domains, newIpCallback) {
+function start(domains, newIpCallback, blockedCallback) {
   whitelist = [...domains];
   onNewIps  = newIpCallback;
+  onBlockedDomain = blockedCallback;
   running   = true;
   startServer();
   setSystemDnsToLocal();
