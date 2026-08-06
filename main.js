@@ -18,6 +18,7 @@ const path       = require('path');
 const sessionMgr = require('./blocker/sessionManager');
 const dnsProxy   = require('./blocker/dnsProxy');
 const firewall   = require('./blocker/firewallManager');
+const aiExpander = require('./blocker/aiDomainExpander');
 
 let mainWindow   = null;
 let tray         = null;
@@ -136,25 +137,34 @@ function stopTickLoop() {
 
 // ─── Session lifecycle ────────────────────────────────────────────────────────
 
-async function startSession(durationMs, whitelist) {
+async function startSession(durationMs, whitelist, groqApiKey) {
   if (!firewall.isRunningAsAdmin()) return { error: 'Administrator privileges required.' };
 
-  // 1. Persist session state.
-  sessionMgr.startSession(durationMs, whitelist);
+  // 1. AI Auto-Detection (Expand whitelist)
+  mainWindow && mainWindow.webContents.send('resolving-start');
+  let finalWhitelist = whitelist;
 
-  // 2. Block known DoH IPs in firewall.
+  if (groqApiKey) {
+    mainWindow && mainWindow.webContents.send('resolve-progress', { domain: 'Asking AI for dependencies...', count: 0 });
+    finalWhitelist = await aiExpander.expandWhitelist(whitelist, groqApiKey);
+  }
+
+  // 2. Persist session state.
+  sessionMgr.startSession(durationMs, finalWhitelist);
+
+  // 3. Block known DoH IPs in firewall.
   firewall.applyRules({
     durationMinutes: durationMs / 60000
   });
 
-  // 3. Start local DNS proxy.
-  dnsProxy.start(whitelist, null, (domain) => {
+  // 4. Start local DNS proxy with expanded list.
+  dnsProxy.start(finalWhitelist, null, (domain) => {
     mainWindow && mainWindow.webContents.send('dns-blocked', { domain, time: Date.now() });
   });
 
   startTickLoop();
   mainWindow && mainWindow.webContents.send('resolving-done', { ipCount: 0 });
-  return { ipCount: 0 };
+  return { ipCount: 0, expandedDomains: finalWhitelist.length };
 }
 
 function endSession() {
@@ -194,11 +204,11 @@ ipcMain.handle('get-status', () => ({
   restorePath: firewall.restoreScriptPath
 }));
 
-ipcMain.handle('start-session', async (_event, { durationMs, whitelist }) => {
+ipcMain.handle('start-session', async (_event, { durationMs, whitelist, groqApiKey }) => {
   if (sessionMgr.isActive()) {
     return { error: 'Session already active' };
   }
-  const result = await startSession(durationMs, whitelist);
+  const result = await startSession(durationMs, whitelist, groqApiKey);
   return { success: true, ...result };
 });
 

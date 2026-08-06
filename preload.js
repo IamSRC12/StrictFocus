@@ -8,7 +8,7 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('sf', {
   // ── Commands (renderer → main) ───────────────────────────────────────────
   getStatus:    ()                  => ipcRenderer.invoke('get-status'),
-  startSession: (durationMs, list)  => ipcRenderer.invoke('start-session', { durationMs, whitelist: list }),
+  startSession: (durationMs, list, groqApiKey) => ipcRenderer.invoke('start-session', { durationMs, whitelist: list, groqApiKey }),
   minimize:     ()                  => ipcRenderer.send('minimize-window'),
   closeApp:     ()                  => ipcRenderer.send('close-window'),
   openExternal: (url)               => ipcRenderer.send('open-external', url),

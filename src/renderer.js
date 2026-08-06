@@ -156,6 +156,8 @@ $('btn-start').addEventListener('click', async () => {
     return;
   }
 
+  const groqApiKey = document.getElementById('groq-api-key') ? document.getElementById('groq-api-key').value.trim() : '';
+
   totalMs = durationMins * 60 * 1000;
   showScreen('resolving');
   $('resolving-log').innerHTML = '';
@@ -163,11 +165,11 @@ $('btn-start').addEventListener('click', async () => {
   // Hook resolve progress events
   window.sf.onResolveProgress(({ domain, count }) => {
     const line = document.createElement('div');
-    line.textContent = `✓ ${domain}  →  ${count} IP${count !== 1 ? 's' : ''}`;
+    line.textContent = count > 0 ? `✓ ${domain}  →  ${count} IP${count !== 1 ? 's' : ''}` : `ℹ ${domain}`;
     $('resolving-log').prepend(line);
   });
 
-  const result = await window.sf.startSession(totalMs, domains);
+  const result = await window.sf.startSession(totalMs, domains, groqApiKey);
 
   window.sf.removeAllListeners('resolve-progress');
 
