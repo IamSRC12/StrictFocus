@@ -11,6 +11,7 @@ const { execSync } = require('child_process');
 const UPSTREAMS = ['1.1.1.1', '8.8.8.8'];
 
 let server        = null;
+let server6       = null;   // IPv6 socket on [::1]:53
 let whitelist     = [];
 let onNewIps      = null;
 let dnsWatchdog   = null;
@@ -122,28 +123,25 @@ function queueIp(ip) {
 
 let onBlockedDomain = null;
 
-function startServer() {
-  stopServer();
-  server = dgram.createSocket({ type: 'udp4', reuseAddr: true });
-
-  server.on('message', (msg, rinfo) => {
+/** Attaches message handler to a UDP socket (shared logic for IPv4 and IPv6). */
+function attachHandler(sock) {
+  sock.on('message', (msg, rinfo) => {
     const domain = parseQuestion(msg);
 
     if (!isWhitelisted(domain)) {
       if (onBlockedDomain && domain) onBlockedDomain(domain);
-      try { server.send(makeNxdomain(msg), rinfo.port, rinfo.address); } catch {}
+      try { sock.send(makeNxdomain(msg), rinfo.port, rinfo.address); } catch {}
       return;
     }
 
     const upstream = dgram.createSocket('udp4');
     let settled = false;
     const done = () => { if (!settled) { settled = true; try { upstream.close(); } catch {} } };
-
     const timer = setTimeout(done, 4000);
 
     upstream.on('message', reply => {
       clearTimeout(timer);
-      try { server.send(reply, rinfo.port, rinfo.address); } catch {}
+      try { sock.send(reply, rinfo.port, rinfo.address); } catch {}
       parseAnswerIps(reply).forEach(queueIp);
       done();
     });
@@ -152,20 +150,46 @@ function startServer() {
     const target = UPSTREAMS[Math.floor(Math.random() * UPSTREAMS.length)];
     upstream.send(msg, 53, target, err => { if (err) { clearTimeout(timer); done(); } });
   });
+}
 
-  server.on('error', err => {
-    console.error('[DNS Proxy] fatal:', err.message);
-    if (err.code === 'EADDRINUSE') {
-      console.error('[DNS Proxy] Port 53 is taken. Stop Internet Connection Sharing / '
-        + 'Hyper-V DNS / Docker DNS, or another resolver, then retry.');
-    }
+/**
+ * Starts the DNS proxy. Returns a Promise that resolves when both sockets are
+ * bound, or rejects with EADDRINUSE if port 53 is already in use.
+ */
+function startServer() {
+  stopServer();
+  return new Promise((resolve, reject) => {
+    server = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+    attachHandler(server);
+
+    server.on('error', err => {
+      console.error('[DNS Proxy] IPv4 error:', err.message);
+      if (err.code === 'EADDRINUSE') reject(err);
+    });
+
+    server.bind(53, '127.0.0.1', () => {
+      console.log('[DNS Proxy] listening on 127.0.0.1:53');
+
+      // Start IPv6 socket
+      server6 = dgram.createSocket({ type: 'udp6', reuseAddr: true });
+      attachHandler(server6);
+
+      server6.on('error', err => {
+        console.warn('[DNS Proxy] IPv6 error (non-fatal):', err.message);
+        // IPv6 failure is non-fatal — IPv4 is still active
+      });
+
+      server6.bind(53, '::1', () => {
+        console.log('[DNS Proxy] listening on [::1]:53');
+        resolve();
+      });
+    });
   });
-
-  server.bind(53, '127.0.0.1', () => console.log('[DNS Proxy] listening on 127.0.0.1:53'));
 }
 
 function stopServer() {
-  if (server) { try { server.close(); } catch {} server = null; }
+  if (server)  { try { server.close();  } catch {} server  = null; }
+  if (server6) { try { server6.close(); } catch {} server6 = null; }
   if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
   pendingIps.clear();
 }
@@ -174,9 +198,20 @@ function stopServer() {
 
 function setSystemDnsToLocal() {
   try {
+    // IPv4: point all adapters at our local proxy
     execSync(
       `powershell -NoProfile -Command "Get-NetAdapter | Where-Object Status -eq 'Up' | `
-      + `Set-DnsClientServerAddress -ServerAddresses '127.0.0.1'"`,
+      + `ForEach-Object { Set-DnsClientServerAddress -InterfaceIndex $_.ifIndex -ServerAddresses '127.0.0.1' }"`,
+      { stdio: 'pipe', windowsHide: true }
+    );
+    // IPv6: point all adapters at ::1
+    execSync(
+      `netsh interface ipv6 set dnsservers name=* source=static address=::1 validate=no`,
+      { stdio: 'pipe', windowsHide: true }
+    );
+    // Disable OS-level DoH server list (best-effort, Windows 11+)
+    execSync(
+      `powershell -NoProfile -Command "Get-DnsClientDohServerAddress -ErrorAction SilentlyContinue | Remove-DnsClientDohServerAddress -ErrorAction SilentlyContinue"`,
       { stdio: 'pipe', windowsHide: true }
     );
     execSync('ipconfig /flushdns', { stdio: 'pipe', windowsHide: true });
@@ -220,12 +255,16 @@ function stopWatchdog() {
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
-function start(domains, newIpCallback, blockedCallback) {
+/**
+ * Starts the DNS proxy.
+ * @returns {Promise<void>} Rejects if port 53 is already in use.
+ */
+async function start(domains, newIpCallback, blockedCallback) {
   whitelist = [...domains];
   onNewIps  = newIpCallback;
   onBlockedDomain = blockedCallback;
   running   = true;
-  startServer();
+  await startServer();   // throws on EADDRINUSE — caller must handle
   setSystemDnsToLocal();
   startWatchdog();
 }

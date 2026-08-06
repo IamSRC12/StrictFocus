@@ -19,6 +19,7 @@ const sessionMgr = require('./blocker/sessionManager');
 const dnsProxy   = require('./blocker/dnsProxy');
 const firewall   = require('./blocker/firewallManager');
 const aiExpander = require('./blocker/aiDomainExpander');
+const resolver   = require('./blocker/dnsResolver');
 
 let mainWindow   = null;
 let tray         = null;
@@ -149,22 +150,39 @@ async function startSession(durationMs, whitelist, groqApiKey) {
     finalWhitelist = await aiExpander.expandWhitelist(whitelist, groqApiKey);
   }
 
-  // 2. Persist session state.
+  // 2. Pre-warm IPs BEFORE lockdown so the machine isn't offline at start
+  mainWindow && mainWindow.webContents.send('resolve-progress', { domain: 'Resolving whitelisted domains...', count: 0 });
+  const preIps = await resolver.resolveWhitelist(finalWhitelist, (domain, count) => {
+    mainWindow && mainWindow.webContents.send('resolve-progress', { domain, count });
+  });
+
+  // 3. Persist session state.
   sessionMgr.startSession(durationMs, finalWhitelist);
 
-  // 3. Block known DoH IPs in firewall.
-  firewall.applyRules({
-    durationMinutes: durationMs / 60000
-  });
+  // 4. Lock down firewall + allow pre-warmed IPs.
+  firewall.applyRules({ durationMinutes: durationMs / 60000 });
+  firewall.allowIps([...preIps]);
 
-  // 4. Start local DNS proxy with expanded list.
-  dnsProxy.start(finalWhitelist, null, (domain) => {
-    mainWindow && mainWindow.webContents.send('dns-blocked', { domain, time: Date.now() });
-  });
+  // 5. Start local DNS proxy — live IP callback wires into the firewall allow-list.
+  try {
+    await dnsProxy.start(
+      finalWhitelist,
+      (ips) => firewall.allowIps(ips),
+      (domain) => mainWindow && mainWindow.webContents.send('dns-blocked', { domain, time: Date.now() })
+    );
+  } catch (err) {
+    if (err.code === 'EADDRINUSE') {
+      // Undo lockdown — can't block DNS if proxy won't start
+      firewall.removeAllRules();
+      sessionMgr.endSession();
+      return { error: 'Port 53 is in use by another service (Hyper-V DNS, Docker, ICS, or Pi-hole). Stop it and retry.' };
+    }
+    throw err;
+  }
 
   startTickLoop();
-  mainWindow && mainWindow.webContents.send('resolving-done', { ipCount: 0 });
-  return { ipCount: 0, expandedDomains: finalWhitelist.length };
+  mainWindow && mainWindow.webContents.send('resolving-done', { ipCount: preIps.size });
+  return { ipCount: preIps.size, expandedDomains: finalWhitelist.length };
 }
 
 function endSession() {
@@ -179,9 +197,13 @@ function endSession() {
 function restoreAfterRestart(whitelist) {
   firewall.applyRules({ durationMinutes: sessionMgr.getRemainingMs() / 60000 });
   firewall.startWatchdog();
-  dnsProxy.start(whitelist, null, (domain) => {
-    mainWindow && mainWindow.webContents.send('dns-blocked', { domain, time: Date.now() });
-  });
+  // Pre-resolve and inject IPs; errors are non-fatal during restore
+  resolver.resolveWhitelist(whitelist).then(ips => firewall.allowIps([...ips])).catch(() => {});
+  dnsProxy.start(
+    whitelist,
+    (ips) => firewall.allowIps(ips),
+    (domain) => mainWindow && mainWindow.webContents.send('dns-blocked', { domain, time: Date.now() })
+  ).catch(err => console.error('[Restore] dnsProxy.start failed:', err.message));
 }
 
 function cleanup() {
