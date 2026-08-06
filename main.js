@@ -3,29 +3,25 @@
  *
  * Responsibilities:
  *  - Create and manage the BrowserWindow & System Tray
- *  - Orchestrate firewallManager + dnsProxy + dnsResolver + sessionManager
+ *  - Orchestrate firewallManager + dnsProxy + sessionManager
  *  - Order of operations on session start:
- *      1. Resolve whitelist domains to IPs while internet still works.
- *      2. Persist session state.
- *      3. Add ALLOW rules for loopback, LAN, DHCP, app DNS, & whitelisted IPs.
- *      4. ONLY THEN flip DefaultOutboundAction to Block on all profiles.
- *      5. Start local DNS proxy (127.0.0.1:53) to return instant NXDOMAIN &
- *         dynamically discover new IPs to allow mid-session.
+ *      1. Persist session state.
+ *      2. Block known DoH IPs in Windows Firewall on TCP/UDP port 443.
+ *      3. Start local DNS proxy (127.0.0.1:53) to return real IPs for whitelisted domains
+ *         and NXDOMAIN for blocked domains.
  *  - Handle app crash recovery (recoverIfStranded) on startup
  *  - Prevent app close during active session
  */
 
 const { app, BrowserWindow, ipcMain, dialog, Tray, Menu, nativeImage, shell } = require('electron');
-const path        = require('path');
-const sessionMgr  = require('./blocker/sessionManager');
-const dnsProxy    = require('./blocker/dnsProxy');
-const firewall    = require('./blocker/firewallManager');
-const dnsResolver = require('./blocker/dnsResolver');
+const path       = require('path');
+const sessionMgr = require('./blocker/sessionManager');
+const dnsProxy   = require('./blocker/dnsProxy');
+const firewall   = require('./blocker/firewallManager');
 
 let mainWindow   = null;
 let tray         = null;
 let tickInterval = null;
-let allowedIps   = new Set();
 
 // ─── Single instance & App lifecycle ──────────────────────────────────────────
 
@@ -143,38 +139,20 @@ function stopTickLoop() {
 async function startSession(durationMs, whitelist) {
   if (!firewall.isRunningAsAdmin()) return { error: 'Administrator privileges required.' };
 
-  // 1. Resolve BEFORE locking down — resolution needs working internet.
-  mainWindow && mainWindow.webContents.send('resolving-start');
-  allowedIps = await dnsResolver.resolveWhitelist(whitelist, (domain, count) => {
-    mainWindow && mainWindow.webContents.send('resolve-progress', { domain, count });
-  });
-
-  if (allowedIps.size === 0) {
-    return { error: 'Could not resolve any whitelisted domain. Check your connection.' };
-  }
-
-  // 2. Persist session state.
+  // 1. Persist session state.
   sessionMgr.startSession(durationMs, whitelist);
 
-  // 3. Lock down the firewall (allow rules first, then deny-by-default).
-  firewall.applyRules(allowedIps, {
-    appPath:         process.execPath,
-    upstreamDnsIps:  dnsProxy.UPSTREAMS,
+  // 2. Block known DoH IPs in firewall.
+  firewall.applyRules({
     durationMinutes: durationMs / 60000
   });
 
-  // 4. Start local DNS; new IPs discovered mid-session get allowed on the fly.
-  dnsProxy.start(whitelist, (newIps) => {
-    const added = firewall.addAllowedIps(newIps);
-    if (added) {
-      newIps.forEach(ip => allowedIps.add(ip));
-      mainWindow && mainWindow.webContents.send('ip-count', { ipCount: allowedIps.size });
-    }
-  });
+  // 3. Start local DNS proxy.
+  dnsProxy.start(whitelist);
 
   startTickLoop();
-  mainWindow && mainWindow.webContents.send('resolving-done', { ipCount: allowedIps.size });
-  return { ipCount: allowedIps.size };
+  mainWindow && mainWindow.webContents.send('resolving-done', { ipCount: 0 });
+  return { ipCount: 0 };
 }
 
 function endSession() {
@@ -186,11 +164,10 @@ function endSession() {
   updateTrayMenu();
 }
 
-async function restoreAfterRestart(whitelist) {
-  allowedIps = await dnsResolver.resolveWhitelist(whitelist).catch(() => new Set());
-  firewall.addAllowedIps(allowedIps);
+function restoreAfterRestart(whitelist) {
+  firewall.applyRules({ durationMinutes: sessionMgr.getRemainingMs() / 60000 });
   firewall.startWatchdog();
-  dnsProxy.start(whitelist, (ips) => firewall.addAllowedIps(ips));
+  dnsProxy.start(whitelist);
 }
 
 function cleanup() {
@@ -209,7 +186,7 @@ ipcMain.handle('get-status', () => ({
   session:     sessionMgr.getSession(),
   isAdmin:     firewall.isRunningAsAdmin(),
   rulesActive: sessionMgr.isActive() ? firewall.verifyRulesActive() : false,
-  ipCount:     allowedIps.size,
+  ipCount:     0,
   restorePath: firewall.restoreScriptPath
 }));
 
@@ -262,3 +239,4 @@ function formatMs(ms) {
     ? `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`
     : `${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')}`;
 }
+

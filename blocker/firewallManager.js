@@ -1,23 +1,12 @@
 /**
  * blocker/firewallManager.js
- * Whitelist-only outbound networking via Windows Firewall.
+ * Blocks known DNS-over-HTTPS (DoH) servers on port 443 via Windows Firewall rules.
  *
- * CRITICAL ARCHITECTURE NOTE (Do NOT introduce block-rules-plus-allow-rules):
- * In the Windows Filtering Platform (WFP), at equal rule weight, BLOCK rules
- * ALWAYS take precedence over ALLOW rules. If you create a global block rule
- * for ports 80/443, ALLOW rules for whitelisted IPs are completely ignored and
- * all traffic is killed.
- *
- * THE ONLY WORKING APPROACH:
- *   1. Capture the machine's current DefaultOutboundAction per profile.
- *   2. Add ALLOW rules for infrastructure + whitelisted IPs.
- *   3. ONLY THEN flip DefaultOutboundAction to Block on all profiles.
- *   Anything without an explicit allow rule is now dropped, including DoH,
- *   QUIC, direct-IP access, and every other app on the machine.
- *
- * SAFETY: A RESTORE_INTERNET.bat is written to %LOCALAPPDATA%\StrictFocus
- * and a SYSTEM scheduled task is registered to run it shortly after the
- * session should end, so a crash/kill can never permanently brick the network.
+ * ARCHITECTURE NOTE:
+ * - Leaves Windows Firewall DefaultOutboundAction as 'Allow' (default behavior).
+ * - Creates explicit OUTBOUND BLOCK rules targeting known DoH resolver IPs on TCP/UDP port 443.
+ * - This prevents modern browsers (Chrome, Edge, Brave) from bypassing system DNS via DoH,
+ *   forcing them to fallback to 127.0.0.1 (StrictFocus DNS Proxy).
  */
 
 const { execSync } = require('child_process');
@@ -31,12 +20,26 @@ const RESTORE_BAT = path.join(DATA_DIR, 'RESTORE_INTERNET.bat');
 const STATE_FILE  = path.join(DATA_DIR, 'firewall-state.json');
 const TASK_NAME   = 'StrictFocusFailsafe';
 
-let ruleIndex  = 0;
-let appliedIps = new Set();
-let watchdog   = null;
-let isActive   = false;
+let watchdog = null;
+let isActive = false;
 
-// ─── PowerShell helper (script file avoids all quote-escaping hell) ──────────
+// Known DNS-over-HTTPS (DoH) server IPs
+const DOH_IPS = [
+  // Cloudflare
+  '1.1.1.1', '1.0.0.1', '1.1.1.2', '1.0.0.2', '1.1.1.3', '1.0.0.3',
+  // Google
+  '8.8.8.8', '8.8.4.4',
+  // Quad9
+  '9.9.9.9', '149.112.112.112', '9.9.9.10', '149.112.112.10',
+  // OpenDNS
+  '208.67.222.222', '208.67.220.220', '208.67.222.220', '208.67.220.222',
+  // AdGuard
+  '94.140.14.14', '94.140.15.15', '94.140.14.140', '94.140.14.141',
+  // NextDNS / Control D / CleanBrowsing / Comcast
+  '45.90.28.0', '45.90.30.0', '76.76.2.0', '76.76.10.0', '185.228.168.9', '185.228.169.9', '68.87.64.19', '68.87.68.19'
+];
+
+// ─── PowerShell Helper ────────────────────────────────────────────────────────
 
 function psRun(script, { quiet = false } = {}) {
   ensureDir();
@@ -59,26 +62,13 @@ function ensureDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-// ─── Baseline capture / restore ──────────────────────────────────────────────
-
-function captureBaseline() {
-  const out = psRun(`Get-NetFirewallProfile | ForEach-Object { "$($_.Name)=$($_.DefaultOutboundAction)" }`);
-  const map = {};
-  out.split(/\r?\n/).forEach(line => {
-    const [name, action] = line.trim().split('=');
-    if (name && action) map[name] = action;
-  });
-  // Windows default if the query failed for any reason
-  if (!Object.keys(map).length) return { Domain: 'Allow', Private: 'Allow', Public: 'Allow' };
-  return map;
-}
+// ─── Emergency Restore Script & Failsafe ─────────────────────────────────────
 
 function writeRestoreScript() {
   ensureDir();
   const bat = `@echo off
 REM StrictFocus emergency network restore. Run as Administrator.
 powershell -NoProfile -Command "Get-NetFirewallRule -DisplayName '${PREFIX}*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule"
-powershell -NoProfile -Command "Set-NetFirewallProfile -Name Domain,Private,Public -DefaultOutboundAction Allow"
 powershell -NoProfile -Command "Get-NetAdapter | Where-Object Status -eq 'Up' | Set-DnsClientServerAddress -ResetServerAddresses"
 powershell -NoProfile -Command "Unregister-ScheduledTask -TaskName '${TASK_NAME}' -Confirm:$false -ErrorAction SilentlyContinue"
 ipconfig /flushdns >nul
@@ -104,121 +94,70 @@ function clearFailsafe() {
   psRun(`Unregister-ScheduledTask -TaskName '${TASK_NAME}' -Confirm:$false -ErrorAction SilentlyContinue`, { quiet: true });
 }
 
-// ─── Rule construction ───────────────────────────────────────────────────────
+// ─── Rule Construction ───────────────────────────────────────────────────────
 
 function clearRules() {
   psRun(`Get-NetFirewallRule -DisplayName '${PREFIX}*' -ErrorAction SilentlyContinue | Remove-NetFirewallRule`, { quiet: true });
-  appliedIps.clear();
-  ruleIndex = 0;
 }
 
 /**
- * Rules that MUST exist or the machine loses basic connectivity — and our own
- * DNS proxy loses its ability to reach upstream resolvers.
+ * Creates outbound BLOCK rules for known DoH server IPs on TCP and UDP port 443.
  */
-function addInfrastructureRules(appPath, upstreamDnsIps) {
-  const dnsList = upstreamDnsIps.map(ip => `'${ip}'`).join(',');
+function blockDohServers() {
+  const dohList = DOH_IPS.map(ip => `'${ip}'`).join(',');
   psRun(`
 $ErrorActionPreference='SilentlyContinue'
-New-NetFirewallRule -DisplayName '${PREFIX}ALLOW_LOOPBACK' -Direction Outbound -Action Allow -RemoteAddress 127.0.0.1 | Out-Null
-New-NetFirewallRule -DisplayName '${PREFIX}ALLOW_LAN'      -Direction Outbound -Action Allow -RemoteAddress LocalSubnet | Out-Null
-New-NetFirewallRule -DisplayName '${PREFIX}ALLOW_DHCP'     -Direction Outbound -Action Allow -Protocol UDP -RemotePort 67,68 | Out-Null
-New-NetFirewallRule -DisplayName '${PREFIX}ALLOW_SELF_DNS' -Direction Outbound -Action Allow -Program '${appPath}' -Protocol UDP -RemotePort 53 -RemoteAddress @(${dnsList}) | Out-Null
+$addrs = @(${dohList})
+New-NetFirewallRule -DisplayName '${PREFIX}BLOCK_DOH_TCP' -Direction Outbound -Action Block -Protocol TCP -RemotePort 443 -RemoteAddress $addrs | Out-Null
+New-NetFirewallRule -DisplayName '${PREFIX}BLOCK_DOH_UDP' -Direction Outbound -Action Block -Protocol UDP -RemotePort 443 -RemoteAddress $addrs | Out-Null
 `);
-}
-
-/**
- * Adds allow rules for a batch of IPs. Windows chokes on huge address lists,
- * so we chunk. TCP 80/443 for HTTP(S), UDP 443 for HTTP/3.
- * Returns the number of newly-allowed IPs.
- */
-function addAllowedIps(ips) {
-  const fresh = [...ips].filter(ip => ip && !appliedIps.has(ip));
-  if (!fresh.length) return 0;
-
-  const CHUNK = 180;
-  for (let i = 0; i < fresh.length; i += CHUNK) {
-    const chunk = fresh.slice(i, i + CHUNK);
-    const list  = chunk.map(ip => `'${ip}'`).join(',');
-    const name  = `${PREFIX}ALLOW_IP_${++ruleIndex}`;
-    psRun(`
-$ErrorActionPreference='SilentlyContinue'
-$addrs = @(${list})
-New-NetFirewallRule -DisplayName '${name}'     -Direction Outbound -Action Allow -Protocol TCP -RemotePort 80,443 -RemoteAddress $addrs | Out-Null
-New-NetFirewallRule -DisplayName '${name}_UDP' -Direction Outbound -Action Allow -Protocol UDP -RemotePort 443     -RemoteAddress $addrs | Out-Null
-`, { quiet: true });
-    chunk.forEach(ip => appliedIps.add(ip));
-  }
-  console.log(`[Firewall] +${fresh.length} IPs allowed (total ${appliedIps.size})`);
-  return fresh.length;
+  console.log(`[Firewall] Created block rules for ${DOH_IPS.length} DoH resolver IPs on port 443.`);
 }
 
 // ─── Public API ──────────────────────────────────────────────────────────────
 
 /**
- * @param {Set<string>|string[]} ips           resolved whitelist IPs
+ * Applies DoH block rules in Windows Firewall.
  * @param {object} opts
- * @param {string} opts.appPath                process.execPath
- * @param {string[]} opts.upstreamDnsIps       resolvers the DNS proxy may reach
- * @param {number} opts.durationMinutes        for the failsafe task
+ * @param {number} opts.durationMinutes - for the failsafe scheduled task
  */
-function applyRules(ips, opts = {}) {
-  const { appPath = process.execPath, upstreamDnsIps = ['1.1.1.1', '8.8.8.8'], durationMinutes = 60 } = opts;
+function applyRules(opts = {}) {
+  const { durationMinutes = 60 } = opts;
 
   ensureDir();
   writeRestoreScript();
 
-  const baseline = captureBaseline();
-  fs.writeFileSync(STATE_FILE, JSON.stringify({ baseline, active: true, ts: Date.now() }, null, 2));
+  fs.writeFileSync(STATE_FILE, JSON.stringify({ active: true, ts: Date.now() }, null, 2));
 
   clearRules();
-  addInfrastructureRules(appPath, upstreamDnsIps);
-  addAllowedIps(ips);
-
-  // Flip to deny-by-default LAST, so we never strand ourselves mid-setup.
-  psRun(`Set-NetFirewallProfile -Name Domain,Private,Public -DefaultOutboundAction Block`);
+  blockDohServers();
 
   registerFailsafe(durationMinutes);
   isActive = true;
   startWatchdog();
-  console.log('[Firewall] Whitelist-only mode ACTIVE.');
+  console.log('[Firewall] DoH blocking ACTIVE.');
 }
 
 function removeAllRules() {
   stopWatchdog();
   isActive = false;
 
-  let baseline = { Domain: 'Allow', Private: 'Allow', Public: 'Allow' };
-  try {
-    if (fs.existsSync(STATE_FILE)) {
-      const s = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-      if (s.baseline) baseline = s.baseline;
-    }
-  } catch {}
-
-  // Restore default policy BEFORE deleting allow rules.
-  const restoreLines = Object.entries(baseline)
-    .map(([name, action]) => `Set-NetFirewallProfile -Name ${name} -DefaultOutboundAction ${action}`)
-    .join('\n');
-  psRun(`$ErrorActionPreference='SilentlyContinue'\n${restoreLines}`);
-
   clearRules();
   clearFailsafe();
 
   try { if (fs.existsSync(STATE_FILE)) fs.unlinkSync(STATE_FILE); } catch {}
-  console.log('[Firewall] Restored normal networking.');
+  console.log('[Firewall] Removed StrictFocus firewall rules.');
 }
 
-/** True only if all profiles are Block AND at least one allow rule exists. */
+/** True if the StrictFocus DoH block rules exist in Windows Firewall. */
 function verifyRulesActive() {
   const out = psRun(
-    `$p = (Get-NetFirewallProfile | Where-Object DefaultOutboundAction -ne 'Block').Count
-$r = (Get-NetFirewallRule -DisplayName '${PREFIX}ALLOW_IP_*' -ErrorAction SilentlyContinue | Measure-Object).Count
-"$p|$r"`,
+    `$r = (Get-NetFirewallRule -DisplayName '${PREFIX}BLOCK_DOH_*' -ErrorAction SilentlyContinue | Measure-Object).Count
+"$r"`,
     { quiet: true }
   ).trim();
-  const [nonBlock, ruleCount] = out.split('|').map(n => parseInt(n, 10));
-  return nonBlock === 0 && ruleCount > 0;
+  const count = parseInt(out, 10);
+  return !isNaN(count) && count > 0;
 }
 
 function startWatchdog() {
@@ -226,12 +165,8 @@ function startWatchdog() {
   watchdog = setInterval(() => {
     if (!isActive) return;
     if (!verifyRulesActive()) {
-      console.warn('[Watchdog] Firewall tampered with — re-applying.');
-      psRun(`Set-NetFirewallProfile -Name Domain,Private,Public -DefaultOutboundAction Block`, { quiet: true });
-      const ips = new Set(appliedIps);
-      appliedIps.clear();
-      ruleIndex = 0;
-      addAllowedIps(ips);
+      console.warn('[Watchdog] DoH block rules missing — re-applying.');
+      blockDohServers();
     }
   }, 20_000);
 }
@@ -244,7 +179,7 @@ function stopWatchdog() {
 function recoverIfStranded(sessionStillActive) {
   const stranded = fs.existsSync(STATE_FILE);
   if (stranded && !sessionStillActive) {
-    console.warn('[Firewall] Found stranded lockdown from a previous run. Restoring.');
+    console.warn('[Firewall] Found stranded state from a previous run. Restoring.');
     removeAllRules();
     return true;
   }
@@ -259,8 +194,9 @@ function isRunningAsAdmin() {
 }
 
 module.exports = {
-  applyRules, addAllowedIps, removeAllRules, verifyRulesActive,
+  applyRules, removeAllRules, verifyRulesActive,
   startWatchdog, stopWatchdog, isRunningAsAdmin,
   recoverIfStranded, writeRestoreScript,
   get restoreScriptPath() { return RESTORE_BAT; }
 };
+
