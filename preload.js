@@ -22,6 +22,7 @@ contextBridge.exposeInMainWorld('sf', {
   onResolvingDone:    (cb) => ipcRenderer.on('resolving-done',    (_e, d) => cb(d)),
   onIpCount:          (cb) => ipcRenderer.on('ip-count',          (_e, d) => cb(d)),
   onCloseBlocked:     (cb) => ipcRenderer.on('close-blocked',     ()      => cb()),
+  onDnsBlocked:       (cb) => ipcRenderer.on('dns-blocked',       (_e, d) => cb(d)),
 
   // ── Cleanup ───────────────────────────────────────────────────────────────
   removeAllListeners: (channel) => ipcRenderer.removeAllListeners(channel),

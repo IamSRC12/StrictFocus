@@ -148,7 +148,9 @@ async function startSession(durationMs, whitelist) {
   });
 
   // 3. Start local DNS proxy.
-  dnsProxy.start(whitelist);
+  dnsProxy.start(whitelist, null, (domain) => {
+    mainWindow && mainWindow.webContents.send('dns-blocked', { domain, time: Date.now() });
+  });
 
   startTickLoop();
   mainWindow && mainWindow.webContents.send('resolving-done', { ipCount: 0 });
@@ -167,7 +169,9 @@ function endSession() {
 function restoreAfterRestart(whitelist) {
   firewall.applyRules({ durationMinutes: sessionMgr.getRemainingMs() / 60000 });
   firewall.startWatchdog();
-  dnsProxy.start(whitelist);
+  dnsProxy.start(whitelist, null, (domain) => {
+    mainWindow && mainWindow.webContents.send('dns-blocked', { domain, time: Date.now() });
+  });
 }
 
 function cleanup() {
